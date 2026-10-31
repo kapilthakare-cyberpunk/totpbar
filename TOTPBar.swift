@@ -181,6 +181,9 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+        let fetch = NSMenuItem(title: "Fetch admin codes", action: #selector(fetchAndCopyAdmin), keyEquivalent: "")
+        fetch.target = self
+        menu.addItem(fetch)
         let hint = NSMenuItem(title: "Click = copy  ·  ⌥-click = pin / unpin", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
@@ -236,6 +239,63 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                            attributes: [.posixPermissions: 0o600])
         }
         NSWorkspace.shared.open(accountsURL)
+    }
+
+    // MARK: - Website code fetching / clipboard
+
+    func fetchSite(_ urlString: String, completion: @escaping (String?) -> Void) {
+        guard let url = URL(string: urlString) else { completion(nil); return }
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            if let data = data {
+                completion(String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1))
+            } else {
+                completion(nil)
+            }
+        }.resume()
+    }
+
+    func tokenPairs(from html: String) -> [String: String] {
+        var pairs: [String: String] = [:]
+        guard let regex = try? NSRegularExpression(pattern: "<input[^>]*>", options: [.caseInsensitive]),
+              let nameRe = try? NSRegularExpression(pattern: "name\\s*=\\s*\"([^\"]*)\""),
+              let valueRe = try? NSRegularExpression(pattern: "value\\s*=\\s*\"([^\"]*)\"") else { return pairs }
+        let matches = regex.matches(in: html, range: NSRange(location: 0, length: Int(html.utf16.count)))
+        for m in matches {
+            let tag = (html as NSString).substring(with: m.range)
+            let nRange = NSRange(location: 0, length: Int((tag as NSString).length))
+            if let nm = nameRe.firstMatch(in: tag, range: nRange), nm.range(at: 1).location != NSNotFound {
+                let name = (tag as NSString).substring(with: nm.range(at: 1))
+                var value = ""
+                if let vm = valueRe.firstMatch(in: tag, range: nRange), vm.range(at: 1).location != NSNotFound {
+                    value = (tag as NSString).substring(with: vm.range(at: 1))
+                }
+                pairs[name] = value
+            }
+        }
+        return pairs
+    }
+
+    @objc func fetchAndCopyAdmin() {
+        let urls = [
+            "https://primesandzooms.com/",
+            "https://primesandzooms.in.suremdm.io/console/v3/"
+        ]
+        var results: [String] = []
+        var remaining = urls.count
+        for u in urls {
+            fetchSite(u) { html in
+                if let html = html, !html.isEmpty {
+                    results.append("URL: \(u)\n\(self.tokenPairs(from: html))")
+                }
+                remaining -= 1
+                if remaining <= 0 {
+                    let text = results.joined(separator: "\n\n")
+                    let pb = NSPasteboard.general
+                    pb.clearContents()
+                    pb.setString(text, forType: .string)
+                }
+            }
+        }
     }
 }
 
