@@ -1,5 +1,6 @@
 import Cocoa
 import CryptoKit
+import UserNotifications
 
 // MARK: - Model
 
@@ -159,6 +160,20 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         live = []
 
+        // Frequently used sites — always shown at the top of the dropdown.
+        let quickLinks: [(String, String)] = [
+            ("Magento Admin", "https://primesandzooms.com/noms"),
+            ("SureMDM Console", "https://primesandzooms.in.suremdm.io/console/v3/")
+        ]
+        for (label, url) in quickLinks {
+            let mi = NSMenuItem(title: label, action: #selector(openQuickLink(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.representedObject = url
+            mi.image = NSImage(systemSymbolName: "globe", accessibilityDescription: label)
+            menu.addItem(mi)
+        }
+        menu.addItem(.separator())
+
         if accounts.isEmpty {
             let mi = NSMenuItem(title: "No accounts found in ~/.config/totp/accounts.txt",
                                 action: nil, keyEquivalent: "")
@@ -181,9 +196,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
-        let fetch = NSMenuItem(title: "Fetch admin codes", action: #selector(fetchAndCopyAdmin), keyEquivalent: "")
-        fetch.target = self
-        menu.addItem(fetch)
         let hint = NSMenuItem(title: "Click = copy  ·  ⌥-click = pin / unpin", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
@@ -191,6 +203,12 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         open.target = self
         menu.addItem(open)
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    @objc func openQuickLink(_ sender: NSMenuItem) {
+        guard let urlString = sender.representedObject as? String,
+              let url = URL(string: urlString) else { return }
+        NSWorkspace.shared.open(url)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -230,6 +248,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let count = pb.changeCount
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
             if NSPasteboard.general.changeCount == count { NSPasteboard.general.clearContents() }
+        }
+        // Feedback so the click visibly registers.
+        let title = a.title
+        let codeCopy = code
+        if #available(macOS 10.14, *) {
+            let center = UNUserNotificationCenter.current()
+            center.requestAuthorization(options: [.alert, .sound]) { _, _ in }
+            let content = UNMutableNotificationContent()
+            content.title = "Copied " + title
+            content.body = codeCopy
+            let req = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
+            center.add(req)
         }
     }
 
