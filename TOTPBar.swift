@@ -160,16 +160,16 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         live = []
 
-        // Frequently used sites — always shown at the top of the dropdown.
-        let quickLinks: [(String, String)] = [
-            ("Magento Admin", "https://primesandzooms.com/noms"),
-            ("SureMDM Console", "https://primesandzooms.in.suremdm.io/console/v3/")
+        // Quick 2FA code copy shortcuts — always shown at the top of the dropdown.
+        let quickCodes: [(String, String)] = [
+            ("Magento Admin", "primesandzooms.com:kapil.thakare@primesandzooms.com"),
+            ("SureMDM Console", "suremdm:42gears")
         ]
-        for (label, url) in quickLinks {
-            let mi = NSMenuItem(title: label, action: #selector(openQuickLink(_:)), keyEquivalent: "")
+        for (label, key) in quickCodes {
+            let mi = NSMenuItem(title: label, action: #selector(copyQuickCode(_:)), keyEquivalent: "")
             mi.target = self
-            mi.representedObject = url
-            mi.image = NSImage(systemSymbolName: "globe", accessibilityDescription: label)
+            mi.representedObject = key
+            mi.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: label)
             menu.addItem(mi)
         }
         menu.addItem(.separator())
@@ -205,10 +205,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
     }
 
-    @objc func openQuickLink(_ sender: NSMenuItem) {
-        guard let urlString = sender.representedObject as? String,
-              let url = URL(string: urlString) else { return }
-        NSWorkspace.shared.open(url)
+    @objc func copyQuickCode(_ sender: NSMenuItem) {
+        guard let key = sender.representedObject as? String,
+              let a = accounts.first(where: { $0.key == key }) else { return }
+        copyCode(for: a)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -240,6 +240,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
             saveFavs()
             return
         }
+        copyCode(for: a)
+    }
+
+    func copyCode(for a: Account) {
         let code = totp(a)
         let pb = NSPasteboard.general
         pb.clearContents()
