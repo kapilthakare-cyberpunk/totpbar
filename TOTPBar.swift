@@ -1,6 +1,8 @@
 import Cocoa
 import CryptoKit
 import UserNotifications
+import Security
+import AVFoundation
 
 // MARK: - Model
 
@@ -18,9 +20,36 @@ struct Account {
         return "\(issuer) (\(name))"
     }
     var key: String { "\(issuer):\(name)".lowercased() }
+    var uriString: String {
+        let secBase32 = secret.base32EncodedString()
+        return "otpauth://totp/\(issuer):\(name)?secret=\(secBase32)&issuer=\(issuer)&digits=\(digits)&period=\(period)&algorithm=\(algo)"
+    }
 }
 
-// MARK: - Base32 / TOTP
+// MARK: - Base32 Extension
+
+extension Data {
+    func base32EncodedString() -> String {
+        let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
+        var bits = 0
+        var value = 0
+        var output = ""
+        for byte in self {
+            value = (value << 8) | Int(byte)
+            bits += 8
+            while bits >= 5 {
+                bits -= 5
+                let idx = (value >> bits) & 0x1F
+                output.append(alphabet[idx])
+            }
+        }
+        if bits > 0 {
+            let idx = (value << (5 - bits)) & 0x1F
+            output.append(alphabet[idx])
+        }
+        return output
+    }
+}
 
 func base32Decode(_ s: String) -> Data? {
     let alphabet = Array("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567")
@@ -88,6 +117,123 @@ func parse(_ line: String) -> Account? {
                    algo: algo)
 }
 
+// MARK: - Keychain Persistence
+
+struct KeychainManager {
+    static let serviceName = "com.kapilthakare.totpbar"
+
+    static func save(key: String, uri: String) {
+        let data = uri.data(using: .utf8)!
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: key,
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+        SecItemDelete(query as CFDictionary)
+        SecItemAdd(query as CFDictionary, nil)
+    }
+
+    static func loadAll() -> [Account] {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecReturnAttributes as String: true,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll
+        ]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess, let items = item as? [[String: Any]] else {
+            return []
+        }
+        var accounts: [Account] = []
+        for dict in items {
+            if let data = dict[kSecValueData as String] as? Data,
+               let uriString = String(data: data, encoding: .utf8),
+               let account = parse(uriString) {
+                accounts.append(account)
+            }
+        }
+        return accounts
+    }
+
+    static func delete(key: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: serviceName,
+            kSecAttrAccount as String: key
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
+
+// MARK: - QR Scanner Window Controller
+
+final class QRScannerWindowController: NSWindowController, AVCaptureMetadataOutputObjectsDelegate, NSWindowDelegate {
+    var captureSession: AVCaptureSession?
+    var onScanned: ((String) -> Void)?
+
+    convenience init(onScanned: @escaping (String) -> Void) {
+        let rect = NSRect(x: 0, y: 0, width: 500, height: 400)
+        let window = NSWindow(contentRect: rect, styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        window.title = "Scan QR Code for 2FA"
+        window.center()
+        self.init(window: window)
+        window.delegate = self
+        self.onScanned = onScanned
+        setupCamera(in: window.contentView!)
+    }
+
+    func setupCamera(in view: NSView) {
+        let session = AVCaptureSession()
+        captureSession = session
+
+        guard let device = AVCaptureDevice.default(for: .video),
+              let input = try? AVCaptureDeviceInput(device: device),
+              session.canAddInput(input) else {
+            let label = NSTextField(labelWithString: "Camera unavailable or permission denied.")
+            label.frame = view.bounds
+            label.alignment = .center
+            view.addSubview(label)
+            return
+        }
+
+        session.addInput(input)
+
+        let output = AVCaptureMetadataOutput()
+        guard session.canAddOutput(output) else { return }
+        session.addOutput(output)
+        output.setMetadataObjectsDelegate(self, queue: DispatchQueue.main)
+        output.metadataObjectTypes = [.qr]
+
+        let previewLayer = AVCaptureVideoPreviewLayer(session: session)
+        previewLayer.frame = view.bounds
+        previewLayer.videoGravity = .resizeAspectFill
+        view.wantsLayer = true
+        view.layer?.addSublayer(previewLayer)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            session.startRunning()
+        }
+    }
+
+    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
+        captureSession?.stopRunning()
+        if let obj = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
+           let str = obj.stringValue,
+           let onScanned = onScanned {
+            onScanned(str)
+            window?.close()
+        }
+    }
+
+    @objc func windowWillClose(_ notification: Notification) {
+        captureSession?.stopRunning()
+    }
+}
+
 // MARK: - App
 
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -101,24 +247,56 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/totp")
     var accountsURL: URL { dir.appendingPathComponent("accounts.txt") }
     var favsURL: URL { dir.appendingPathComponent("favorites.txt") }
+    var hasLaunchedBeforeKey = "HasLaunchedBefore"
 
     func applicationDidFinishLaunching(_ n: Notification) {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        migrateIfNeeded()
         menu.delegate = self
         item.menu = menu
         if let b = item.button {
             b.image = NSImage(systemSymbolName: "lock.shield", accessibilityDescription: "2FA")
         }
+
+        // Check first launch / onboarding
+        let defaults = UserDefaults.standard
+        if !defaults.bool(forKey: hasLaunchedBeforeKey) {
+            defaults.set(true, forKey: hasLaunchedBeforeKey)
+            showWelcomeOnboarding()
+        }
+    }
+
+    func migrateIfNeeded() {
+        let existing = KeychainManager.loadAll()
+        if existing.isEmpty {
+            let text = (try? String(contentsOf: accountsURL, encoding: .utf8)) ?? ""
+            let lines = text.split(whereSeparator: \.isNewline)
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { $0.hasPrefix("otpauth://") }
+            for line in lines {
+                if let acc = parse(line) {
+                    KeychainManager.save(key: acc.key, uri: line)
+                }
+            }
+        }
+        let f = (try? String(contentsOf: favsURL, encoding: .utf8)) ?? ""
+        favs = f.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
+            .filter { !$0.isEmpty }
+    }
+
+    func showWelcomeOnboarding() {
+        let alert = NSAlert()
+        alert.messageText = "Welcome to TOTPBar 🛡️"
+        alert.informativeText = "TOTPBar is your secure, privacy-focused Mac menu bar app for Two-Factor Authentication.\n\nYour secrets are safely encrypted in the macOS Keychain. You can add your first 2FA account via Manual Entry, QR Code scanning, or Clipboard paste."
+        alert.addButton(withTitle: "Get Started")
+        alert.runModal()
     }
 
     // Data
 
     func load() {
-        let text = (try? String(contentsOf: accountsURL, encoding: .utf8)) ?? ""
-        accounts = text.split(whereSeparator: \.isNewline)
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { $0.hasPrefix("otpauth://") }
-            .compactMap(parse)
+        accounts = KeychainManager.loadAll()
             .sorted { $0.title.localizedCaseInsensitiveCompare($1.title) == .orderedAscending }
         let f = (try? String(contentsOf: favsURL, encoding: .utf8)) ?? ""
         favs = f.split(whereSeparator: \.isNewline)
@@ -160,25 +338,15 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         live = []
 
-        // Quick 2FA code copy shortcuts — always shown at the top of the dropdown.
-        let quickCodes: [(String, String)] = [
-            ("Magento Admin", "primesandzooms.com:kapil.thakare@primesandzooms.com"),
-            ("SureMDM Console", "suremdm:42gears")
-        ]
-        for (label, key) in quickCodes {
-            let mi = NSMenuItem(title: label, action: #selector(copyQuickCode(_:)), keyEquivalent: "")
-            mi.target = self
-            mi.representedObject = key
-            mi.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: label)
-            menu.addItem(mi)
-        }
-        menu.addItem(.separator())
-
         if accounts.isEmpty {
-            let mi = NSMenuItem(title: "No accounts found in ~/.config/totp/accounts.txt",
-                                action: nil, keyEquivalent: "")
-            mi.isEnabled = false
-            menu.addItem(mi)
+            let welcomeItem = NSMenuItem(title: "No 2FA accounts found", action: nil, keyEquivalent: "")
+            welcomeItem.isEnabled = false
+            menu.addItem(welcomeItem)
+            
+            let addFirst = NSMenuItem(title: "Add your first account...", action: #selector(addAccountPrompt), keyEquivalent: "")
+            addFirst.target = self
+            menu.addItem(addFirst)
+            menu.addItem(.separator())
         }
 
         let pinned = favs.compactMap { k in accounts.first { $0.key == k } }
@@ -196,19 +364,27 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
 
         menu.addItem(.separator())
+
+        let addMenu = NSMenuItem(title: "Add Account...", action: #selector(addAccountPrompt), keyEquivalent: "n")
+        addMenu.target = self
+        menu.addItem(addMenu)
+
+        let scanMenu = NSMenuItem(title: "Scan QR Code...", action: #selector(scanQRCode), keyEquivalent: "")
+        scanMenu.target = self
+        menu.addItem(scanMenu)
+
+        let pasteMenu = NSMenuItem(title: "Import from Clipboard (otpauth://)", action: #selector(importFromClipboard), keyEquivalent: "v")
+        pasteMenu.target = self
+        menu.addItem(pasteMenu)
+
+        menu.addItem(.separator())
         let hint = NSMenuItem(title: "Click = copy  ·  ⌥-click = pin / unpin", action: nil, keyEquivalent: "")
         hint.isEnabled = false
         menu.addItem(hint)
-        let open = NSMenuItem(title: "Open accounts file", action: #selector(openFile), keyEquivalent: "")
+        let open = NSMenuItem(title: "Open accounts file / Backup", action: #selector(openFile), keyEquivalent: "")
         open.target = self
         menu.addItem(open)
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
-    }
-
-    @objc func copyQuickCode(_ sender: NSMenuItem) {
-        guard let key = sender.representedObject as? String,
-              let a = accounts.first(where: { $0.key == key }) else { return }
-        copyCode(for: a)
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -253,7 +429,6 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
             if NSPasteboard.general.changeCount == count { NSPasteboard.general.clearContents() }
         }
-        // Feedback so the click visibly registers.
         let title = a.title
         let codeCopy = code
         if #available(macOS 10.14, *) {
@@ -267,69 +442,105 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc func addAccountPrompt() {
+        let alert = NSAlert()
+        alert.messageText = "Add 2FA Account"
+        alert.informativeText = "Paste an otpauth:// URI or fill in details manually."
+
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 320, height: 160))
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 8
+
+        let uriField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        uriField.placeholderString = "otpauth://totp/..."
+
+        let issuerField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        issuerField.placeholderString = "Issuer (e.g. GitHub)"
+
+        let nameField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        nameField.placeholderString = "Account Name (e.g. user@gmail.com)"
+
+        let secretField = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        secretField.placeholderString = "Secret (Base32)"
+
+        stack.addArrangedSubview(NSTextField(labelWithString: "URI:"))
+        stack.addArrangedSubview(uriField)
+        stack.addArrangedSubview(NSTextField(labelWithString: "Or Manual:"))
+        stack.addArrangedSubview(issuerField)
+        stack.addArrangedSubview(nameField)
+        stack.addArrangedSubview(secretField)
+
+        alert.accessoryView = stack
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            let uri = uriField.stringValue.trimmingCharacters(in: .whitespaces)
+            if !uri.isEmpty {
+                if let acc = parse(uri) {
+                    KeychainManager.save(key: acc.key, uri: uri)
+                    load()
+                    rebuild()
+                }
+            } else {
+                let issuer = issuerField.stringValue.trimmingCharacters(in: .whitespaces)
+                let name = nameField.stringValue.trimmingCharacters(in: .whitespaces)
+                let secret = secretField.stringValue.trimmingCharacters(in: .whitespaces)
+                if !secret.isEmpty {
+                    let constructed = "otpauth://totp/\(issuer):\(name)?secret=\(secret)&issuer=\(issuer)"
+                    if let acc = parse(constructed) {
+                        KeychainManager.save(key: acc.key, uri: constructed)
+                        load()
+                        rebuild()
+                    }
+                }
+            }
+        }
+    }
+
+    @objc func importFromClipboard() {
+        let pb = NSPasteboard.general
+        guard let str = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              str.hasPrefix("otpauth://"),
+              let acc = parse(str) else {
+            let alert = NSAlert()
+            alert.messageText = "Import Failed"
+            alert.informativeText = "No valid otpauth:// URI found in clipboard."
+            alert.runModal()
+            return
+        }
+        KeychainManager.save(key: acc.key, uri: str)
+        load()
+        rebuild()
+        let alert = NSAlert()
+        alert.messageText = "Account Added"
+        alert.informativeText = "Successfully imported \(acc.title)."
+        alert.runModal()
+    }
+
+    var scannerController: QRScannerWindowController?
+
+    @objc func scanQRCode() {
+        scannerController = QRScannerWindowController { [weak self] uri in
+            if let acc = parse(uri) {
+                KeychainManager.save(key: acc.key, uri: uri)
+                self?.load()
+                self?.rebuild()
+            }
+        }
+        scannerController?.showWindow(nil)
+        scannerController?.window?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
     @objc func openFile() {
         if !FileManager.default.fileExists(atPath: accountsURL.path) {
-            FileManager.default.createFile(atPath: accountsURL.path, contents: Data(),
-                                           attributes: [.posixPermissions: 0o600])
+            let initial = accounts.map { $0.uriString }.joined(separator: "\n")
+            try? initial.write(to: accountsURL, atomically: true, encoding: .utf8)
         }
         NSWorkspace.shared.open(accountsURL)
-    }
-
-    // MARK: - Website code fetching / clipboard
-
-    func fetchSite(_ urlString: String, completion: @escaping (String?) -> Void) {
-        guard let url = URL(string: urlString) else { completion(nil); return }
-        URLSession.shared.dataTask(with: url) { data, _, _ in
-            if let data = data {
-                completion(String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1))
-            } else {
-                completion(nil)
-            }
-        }.resume()
-    }
-
-    func tokenPairs(from html: String) -> [String: String] {
-        var pairs: [String: String] = [:]
-        guard let regex = try? NSRegularExpression(pattern: "<input[^>]*>", options: [.caseInsensitive]),
-              let nameRe = try? NSRegularExpression(pattern: "name\\s*=\\s*\"([^\"]*)\""),
-              let valueRe = try? NSRegularExpression(pattern: "value\\s*=\\s*\"([^\"]*)\"") else { return pairs }
-        let matches = regex.matches(in: html, range: NSRange(location: 0, length: Int(html.utf16.count)))
-        for m in matches {
-            let tag = (html as NSString).substring(with: m.range)
-            let nRange = NSRange(location: 0, length: Int((tag as NSString).length))
-            if let nm = nameRe.firstMatch(in: tag, range: nRange), nm.range(at: 1).location != NSNotFound {
-                let name = (tag as NSString).substring(with: nm.range(at: 1))
-                var value = ""
-                if let vm = valueRe.firstMatch(in: tag, range: nRange), vm.range(at: 1).location != NSNotFound {
-                    value = (tag as NSString).substring(with: vm.range(at: 1))
-                }
-                pairs[name] = value
-            }
-        }
-        return pairs
-    }
-
-    @objc func fetchAndCopyAdmin() {
-        let urls = [
-            "https://primesandzooms.com/",
-            "https://primesandzooms.in.suremdm.io/console/v3/"
-        ]
-        var results: [String] = []
-        var remaining = urls.count
-        for u in urls {
-            fetchSite(u) { html in
-                if let html = html, !html.isEmpty {
-                    results.append("URL: \(u)\n\(self.tokenPairs(from: html))")
-                }
-                remaining -= 1
-                if remaining <= 0 {
-                    let text = results.joined(separator: "\n\n")
-                    let pb = NSPasteboard.general
-                    pb.clearContents()
-                    pb.setString(text, forType: .string)
-                }
-            }
-        }
     }
 }
 
